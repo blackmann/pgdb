@@ -2,6 +2,14 @@
 
 `berry` is a bash-only Postgres branch manager with a small TUI powered by [`gum`](https://github.com/charmbracelet/gum).
 
+## Install
+
+Install `berry` from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blackmann/pgdb/main/install.sh | bash
+```
+
 ## What it does
 
 - `berry list` shows databases on the current Postgres instance
