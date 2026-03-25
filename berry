@@ -1,0 +1,1063 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+VERSION="0.1.0"
+BRANCH_SEPARATOR="__"
+CREATE_NEW_BRANCH_OPTION="Create a new branch"
+COLOR_GRAY=$'\033[38;5;245m'
+COLOR_RESET=$'\033[0m'
+USE_COLOR=0
+
+usage() {
+  cat <<'EOF'
+berry - bash postgres branch manager
+
+Usage:
+  berry list
+  berry list --branches <database>
+  berry branch
+  berry delete [branch_database]
+  berry url <database>
+  berry help
+
+Commands:
+  list              Show databases on the current Postgres instance
+  list --branches   Show branches for a source database
+  branch            Interactively create or switch to a database branch
+  delete            Interactively delete a branch database
+  url               Print a Postgres URL for a database
+  help              Show this help text
+
+Environment:
+  DBURL         optional Postgres connection URL
+  DATABASE_URL  optional fallback if DBURL is unset
+
+Branch naming:
+  Branch databases are named <source_db>__<branch_name>
+EOF
+}
+
+die() {
+  printf 'berry: %s\n' "$*" >&2
+  exit 1
+}
+
+note() {
+  printf 'berry: %s\n' "$*"
+}
+
+supports_color() {
+  [ "$USE_COLOR" -eq 1 ]
+}
+
+gray_text() {
+  local text="$1"
+
+  if supports_color; then
+    printf '%s%s%s\n' "$COLOR_GRAY" "$text" "$COLOR_RESET"
+  else
+    printf '%s\n' "$text"
+  fi
+}
+
+gray_inline() {
+  local text="$1"
+
+  if supports_color; then
+    printf '%s%s%s' "$COLOR_GRAY" "$text" "$COLOR_RESET"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+require_command() {
+  local command_name="$1"
+  local install_hint="${2:-}"
+
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ -n "$install_hint" ]; then
+    die "Missing dependency '$command_name'. $install_hint"
+  fi
+
+  die "Missing dependency '$command_name'."
+}
+
+resolve_dburl() {
+  if [ -n "${DBURL:-}" ]; then
+    printf '%s\n' "$DBURL"
+    return 0
+  fi
+
+  if [ -n "${DATABASE_URL:-}" ]; then
+    printf '%s\n' "$DATABASE_URL"
+    return 0
+  fi
+
+  if [ -n "${dburl:-}" ]; then
+    printf '%s\n' "$dburl"
+    return 0
+  fi
+
+  return 1
+}
+
+redact_dburl() {
+  local raw="$1"
+
+  case "$raw" in
+    *://*:*@*)
+      printf '%s\n' "$(printf '%s' "$raw" | sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#')"
+      ;;
+    *)
+      printf '%s\n' "$raw"
+      ;;
+  esac
+}
+
+ensure_psql() {
+  require_command "psql" "Install PostgreSQL client tools and make sure 'psql' is on PATH."
+}
+
+ensure_gum() {
+  require_command "gum" "Install Charm's gum first. On macOS: brew install gum"
+}
+
+sql_quote_ident() {
+  local escaped="${1//\"/\"\"}"
+  printf '"%s"' "$escaped"
+}
+
+urlencode() {
+  local raw="$1"
+  local encoded=""
+  local i
+  local char
+  local hex
+
+  LC_ALL=C
+  for ((i = 0; i < ${#raw}; i++)); do
+    char="${raw:i:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-])
+        encoded="${encoded}${char}"
+        ;;
+      *)
+        printf -v hex '%02X' "'$char"
+        encoded="${encoded}%${hex}"
+        ;;
+    esac
+  done
+
+  printf '%s' "$encoded"
+}
+
+format_url_host() {
+  local host="$1"
+
+  case "$host" in
+    *:*)
+      printf '[%s]\n' "$host"
+      ;;
+    *)
+      printf '%s\n' "$host"
+      ;;
+  esac
+}
+
+fetch_connection_details() {
+  run_psql "SELECT current_user, current_setting('port'), COALESCE(inet_server_addr()::text, '');"
+}
+
+rewrite_dburl_database() {
+  local base_dburl="$1"
+  local database_name="$2"
+  local encoded_database
+  local scheme
+  local remainder
+  local authority
+  local query=""
+
+  encoded_database="$(urlencode "$database_name")"
+
+  if [ "${base_dburl#*\?}" != "$base_dburl" ]; then
+    query="?${base_dburl#*\?}"
+    base_dburl="${base_dburl%%\?*}"
+  fi
+
+  case "$base_dburl" in
+    *://*)
+      scheme="${base_dburl%%://*}"
+      remainder="${base_dburl#*://}"
+      if [ "${remainder#*/}" != "$remainder" ]; then
+        authority="${remainder%%/*}"
+      else
+        authority="$remainder"
+      fi
+      printf '%s://%s/%s%s\n' "$scheme" "$authority" "$encoded_database" "$query"
+      ;;
+    *)
+      printf '%s/%s%s\n' "${base_dburl%/}" "$encoded_database" "$query"
+      ;;
+  esac
+}
+
+build_db_url() {
+  local database_name="$1"
+  local encoded_database
+  local base_dburl
+  local connection_details
+  local inferred_user
+  local inferred_port
+  local inferred_host
+  local encoded_user
+  local formatted_host
+
+  encoded_database="$(urlencode "$database_name")"
+
+  if ! base_dburl="$(resolve_dburl)"; then
+    if connection_details="$(fetch_connection_details 2>/dev/null)"; then
+      inferred_user="$(printf '%s' "$connection_details" | awk -F'|' 'NR==1 {print $1}')"
+      inferred_port="$(printf '%s' "$connection_details" | awk -F'|' 'NR==1 {print $2}')"
+      inferred_host="$(printf '%s' "$connection_details" | awk -F'|' 'NR==1 {print $3}')"
+
+      [ -n "$inferred_user" ] || inferred_user="$USER"
+      [ -n "$inferred_port" ] || inferred_port="5432"
+      [ -n "$inferred_host" ] || inferred_host="localhost"
+
+      encoded_user="$(urlencode "$inferred_user")"
+      formatted_host="$(format_url_host "$inferred_host")"
+      printf 'postgresql://%s@%s:%s/%s\n' \
+        "$encoded_user" \
+        "$formatted_host" \
+        "$inferred_port" \
+        "$encoded_database"
+      return 0
+    fi
+
+    printf 'postgresql://localhost/%s\n' "$encoded_database"
+    return 0
+  fi
+
+  rewrite_dburl_database "$base_dburl" "$database_name"
+}
+
+run_psql_in_database() {
+  local database_name="$1"
+  local sql="$2"
+  local output
+  local dburl
+
+  if dburl="$(resolve_dburl)"; then
+    dburl="$(rewrite_dburl_database "$dburl" "$database_name")"
+    if ! output="$(
+      psql \
+        -X \
+        -A \
+        -t \
+        -q \
+        -v ON_ERROR_STOP=1 \
+        -d "$dburl" \
+        -c "$sql" \
+        2>&1
+    )"; then
+      printf '%s\n' "$output"
+      return 1
+    fi
+  elif ! output="$(
+    psql \
+      -X \
+      -A \
+      -t \
+      -q \
+      -v ON_ERROR_STOP=1 \
+      -d "$database_name" \
+      -c "$sql" \
+      2>&1
+  )"; then
+    printf '%s\n' "$output"
+    return 1
+  fi
+
+  printf '%s\n' "$output"
+}
+
+run_psql() {
+  local sql="$1"
+  local output
+  local dburl
+
+  if dburl="$(resolve_dburl)"; then
+    if ! output="$(
+      psql \
+        -X \
+        -A \
+        -t \
+        -q \
+        -v ON_ERROR_STOP=1 \
+        -d "$dburl" \
+        -c "$sql" \
+        2>&1
+    )"; then
+      printf '%s\n' "$output"
+      return 1
+    fi
+  elif ! output="$(
+    psql \
+      -X \
+      -A \
+      -t \
+      -q \
+      -v ON_ERROR_STOP=1 \
+      -c "$sql" \
+      2>&1
+  )"; then
+    printf '%s\n' "$output"
+    return 1
+  fi
+
+  printf '%s\n' "$output"
+}
+
+fetch_all_databases() {
+  run_psql_in_database "postgres" "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;"
+}
+
+fetch_database_sizes() {
+  run_psql_in_database "postgres" "SELECT datname || '|' || pg_database_size(datname) FROM pg_database WHERE datistemplate = false ORDER BY datname;"
+}
+
+handle_connection_failure() {
+  local details="$1"
+  local dburl
+
+  if dburl="$(resolve_dburl)"; then
+    printf 'berry: Could not connect to Postgres using DBURL.\n' >&2
+    printf 'berry: Connection target: %s\n' "$(redact_dburl "$dburl")" >&2
+  else
+    printf 'berry: Could not connect to Postgres using your local psql defaults.\n' >&2
+  fi
+  printf 'berry: %s\n' "$details" >&2
+  exit 1
+}
+
+is_system_database() {
+  [ "$1" = "postgres" ]
+}
+
+is_branch_database() {
+  case "$1" in
+    *"$BRANCH_SEPARATOR"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+count_lines() {
+  local input="$1"
+  local line
+  local count=0
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    count=$((count + 1))
+  done <<< "$input"
+
+  printf '%s\n' "$count"
+}
+
+database_exists() {
+  local database_name="$1"
+  local all_databases="$2"
+  local entry
+
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    if [ "$entry" = "$database_name" ]; then
+      return 0
+    fi
+  done <<< "$all_databases"
+
+  return 1
+}
+
+database_size_for_name() {
+  local size_rows="$1"
+  local database_name="$2"
+  local row_name
+  local row_size_bytes
+
+  while IFS='|' read -r row_name row_size_bytes; do
+    [ -n "$row_name" ] || continue
+    if [ "$row_name" = "$database_name" ]; then
+      format_size_bytes "$row_size_bytes"
+      return 0
+    fi
+  done <<< "$size_rows"
+
+  printf '%s\n' "-"
+}
+
+format_size_bytes() {
+  local bytes="${1:-0}"
+
+  awk -v bytes="$bytes" '
+    BEGIN {
+      split("b kb mb gb tb pb", units, " ")
+      size = bytes + 0
+      unit = 1
+      while (size >= 1024 && unit < 6) {
+        size /= 1024
+        unit++
+      }
+      printf "%.2f%s\n", size, units[unit]
+    }
+  '
+}
+
+filter_regular_databases() {
+  local all_databases="$1"
+  local database_name
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    is_system_database "$database_name" && continue
+    is_branch_database "$database_name" && continue
+    printf '%s\n' "$database_name"
+  done <<< "$all_databases"
+}
+
+filter_branch_databases() {
+  local all_databases="$1"
+  local database_name
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    is_branch_database "$database_name" || continue
+    printf '%s\n' "$database_name"
+  done <<< "$all_databases"
+}
+
+filter_branch_databases_for_source() {
+  local source_database="$1"
+  local all_databases="$2"
+  local database_name
+  local prefix="${source_database}${BRANCH_SEPARATOR}"
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    case "$database_name" in
+      "$prefix"*)
+        printf '%s\n' "$database_name"
+        ;;
+    esac
+  done <<< "$all_databases"
+}
+
+filter_system_databases() {
+  local all_databases="$1"
+  local database_name
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    is_system_database "$database_name" || continue
+    printf '%s\n' "$database_name"
+  done <<< "$all_databases"
+}
+
+branch_name_for_source() {
+  local source_database="$1"
+  local branch_database="$2"
+
+  printf '%s\n' "${branch_database#${source_database}${BRANCH_SEPARATOR}}"
+}
+
+display_branch_name_for_source() {
+  local source_database="$1"
+  local branch_database="$2"
+
+  printf '%s/%s\n' "$source_database" "$(branch_name_for_source "$source_database" "$branch_database")"
+}
+
+branch_source_for_database() {
+  local branch_database="$1"
+
+  printf '%s\n' "${branch_database%%${BRANCH_SEPARATOR}*}"
+}
+
+display_database_name() {
+  local database_name="$1"
+  local branch_source
+  local branch_name
+
+  if ! is_branch_database "$database_name"; then
+    printf '%s\n' "$database_name"
+    return 0
+  fi
+
+  branch_source="$(branch_source_for_database "$database_name")"
+  branch_name="$(branch_name_for_source "$branch_source" "$database_name")"
+  printf '%s/%s\n' "$branch_source" "$branch_name"
+}
+
+canonical_database_name() {
+  local input_name="$1"
+
+  if is_branch_database "$input_name"; then
+    printf '%s\n' "$input_name"
+    return 0
+  fi
+
+  case "$input_name" in
+    */*)
+      printf '%s\n' "${input_name/\//$BRANCH_SEPARATOR}"
+      ;;
+    *)
+      printf '%s\n' "$input_name"
+      ;;
+  esac
+}
+
+filter_orphan_branch_databases() {
+  local regular_databases="$1"
+  local branch_databases="$2"
+  local branch_database
+  local source_database
+
+  while IFS= read -r branch_database; do
+    [ -n "$branch_database" ] || continue
+    source_database="$(branch_source_for_database "$branch_database")"
+    if ! database_exists "$source_database" "$regular_databases"; then
+      printf '%s\n' "$branch_database"
+    fi
+  done <<< "$branch_databases"
+}
+
+print_section() {
+  local title="$1"
+  local lines="$2"
+
+  if [ "$(count_lines "$lines")" -eq 0 ]; then
+    return 0
+  fi
+
+  if [ "$title" = "Databases" ] || [ "$title" = "System" ]; then
+    gray_text "$title"
+  else
+    printf '%s\n' "$title"
+  fi
+  printf '%s\n' "$lines"
+  printf '\n'
+}
+
+line_length() {
+  local text="$1"
+  printf '%s\n' "${#text}"
+}
+
+max_value() {
+  local left="$1"
+  local right="$2"
+
+  if [ "$left" -gt "$right" ]; then
+    printf '%s\n' "$left"
+  else
+    printf '%s\n' "$right"
+  fi
+}
+
+compute_list_label_width() {
+  local regular_databases="$1"
+  local all_databases="$2"
+  local detached_branches="$3"
+  local system_databases="$4"
+  local width=0
+  local database_name
+  local branches_for_database
+  local branch_database
+  local branch_label
+  local candidate_width
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    candidate_width="$(line_length "◆ $database_name")"
+    width="$(max_value "$width" "$candidate_width")"
+
+    branches_for_database="$(filter_branch_databases_for_source "$database_name" "$all_databases")"
+    while IFS= read -r branch_database; do
+      [ -n "$branch_database" ] || continue
+      branch_label="$(branch_name_for_source "$database_name" "$branch_database")"
+      candidate_width="$(line_length "╰─ $branch_label")"
+      width="$(max_value "$width" "$candidate_width")"
+    done <<< "$branches_for_database"
+  done <<< "$regular_databases"
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    candidate_width="$(line_length "$database_name")"
+    width="$(max_value "$width" "$candidate_width")"
+  done <<< "$detached_branches"
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    candidate_width="$(line_length "$database_name")"
+    width="$(max_value "$width" "$candidate_width")"
+  done <<< "$system_databases"
+
+  printf '%s\n' "$width"
+}
+
+render_aligned_line() {
+  local rendered_label="$1"
+  local raw_label="$2"
+  local size="$3"
+  local width="$4"
+  local label_length
+  local padding_width
+  local padding=""
+
+  label_length="$(line_length "$raw_label")"
+  padding_width=$((width - label_length + 6))
+
+  while [ "$padding_width" -gt 0 ]; do
+    padding="${padding} "
+    padding_width=$((padding_width - 1))
+  done
+
+  printf '%s%s%s\n' "$rendered_label" "$padding" "$(gray_inline "$size")"
+}
+
+render_regular_database_tree() {
+  local regular_databases="$1"
+  local all_databases="$2"
+  local size_rows="$3"
+  local label_width="$4"
+  local database_name
+  local branches_for_database
+  local branch_database
+  local branch_count
+  local branch_index
+  local branch_label
+  local database_size
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    database_size="$(database_size_for_name "$size_rows" "$database_name")"
+    render_aligned_line "$(printf '%s %s' "$(gray_inline "◆")" "$database_name")" "◆ $database_name" "$database_size" "$label_width"
+
+    branches_for_database="$(filter_branch_databases_for_source "$database_name" "$all_databases")"
+    branch_count="$(count_lines "$branches_for_database")"
+    branch_index=0
+
+    while IFS= read -r branch_database; do
+      [ -n "$branch_database" ] || continue
+      branch_index=$((branch_index + 1))
+      branch_label="$(branch_name_for_source "$database_name" "$branch_database")"
+      database_size="$(database_size_for_name "$size_rows" "$branch_database")"
+
+      if [ "$branch_index" -eq "$branch_count" ]; then
+        render_aligned_line "$(printf '%s %s' "$(gray_inline "╰─")" "$branch_label")" "╰─ $branch_label" "$database_size" "$label_width"
+      else
+        render_aligned_line "$(printf '%s %s' "$(gray_inline "├─")" "$branch_label")" "├─ $branch_label" "$database_size" "$label_width"
+      fi
+    done <<< "$branches_for_database"
+  done <<< "$regular_databases"
+}
+
+render_plain_database_lines() {
+  local databases="$1"
+  local size_rows="$2"
+  local label_width="$3"
+  local display_mode="${4:-database}"
+  local database_name
+  local database_size
+  local display_name
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    database_size="$(database_size_for_name "$size_rows" "$database_name")"
+    case "$display_mode" in
+      branch-only)
+        display_name="${database_name#*${BRANCH_SEPARATOR}}"
+        ;;
+      *)
+        display_name="$(display_database_name "$database_name")"
+        ;;
+    esac
+    render_aligned_line "$display_name" "$display_name" "$database_size" "$label_width"
+  done <<< "$databases"
+}
+
+gum_choose_from_lines() {
+  local header="$1"
+  local lines="$2"
+  local choice
+
+  [ "$(count_lines "$lines")" -gt 0 ] || return 1
+
+  if ! choice="$(printf '%s\n' "$lines" | gum choose --header "$header")"; then
+    die "Cancelled."
+  fi
+
+  printf '%s\n' "$choice"
+}
+
+gum_input_value() {
+  local prompt="$1"
+  local placeholder="$2"
+  local value
+
+  if ! value="$(gum input --prompt "$prompt" --placeholder "$placeholder")"; then
+    die "Cancelled."
+  fi
+
+  printf '%s\n' "$value"
+}
+
+gum_confirm_action() {
+  local prompt="$1"
+
+  if gum confirm "$prompt"; then
+    return 0
+  fi
+
+  return 1
+}
+
+normalize_branch_name() {
+  local raw="$1"
+  local normalized
+
+  normalized="$(
+    printf '%s' "$raw" |
+      tr '[:upper:]' '[:lower:]' |
+      sed -E 's/[^a-z0-9]+/_/g; s/_+/_/g; s/^_+//; s/_+$//'
+  )"
+
+  printf '%s\n' "$normalized"
+}
+
+clone_database() {
+  local source_database="$1"
+  local target_database="$2"
+  local sql
+  local output
+
+  sql="CREATE DATABASE $(sql_quote_ident "$target_database") WITH TEMPLATE $(sql_quote_ident "$source_database");"
+
+  if ! output="$(run_psql_in_database "postgres" "$sql")"; then
+    case "$output" in
+      *"is being accessed by other users"*)
+        die "Could not clone '$source_database' because it is currently in use. Close other connections and try again."
+        ;;
+      *"permission denied"*|*"must be owner of database"*|*"must have"* )
+        die "Could not create '$target_database'. Ensure '$PGUSER' can create databases and clone '$source_database'."
+        ;;
+      *)
+        die "Could not create '$target_database'. $output"
+        ;;
+    esac
+  fi
+}
+
+delete_branch_database() {
+  local branch_database="$1"
+  local sql
+  local output
+
+  sql="DROP DATABASE $(sql_quote_ident "$branch_database");"
+
+  if ! output="$(run_psql_in_database "postgres" "$sql")"; then
+    case "$output" in
+      *"is being accessed by other users"*)
+        die "Could not delete '$branch_database' because it is currently in use. Close other connections and try again."
+        ;;
+      *"permission denied"*|*"must be owner of database"*|*"must have"* )
+        die "Could not delete '$branch_database'. Ensure you can drop that database."
+        ;;
+      *"does not exist"*)
+        die "Branch '$branch_database' no longer exists."
+        ;;
+      *)
+        die "Could not delete '$branch_database'. $output"
+        ;;
+    esac
+  fi
+}
+
+branch_options_for_source() {
+  local source_database="$1"
+  local existing_branches="$2"
+  local database_name
+
+  while IFS= read -r database_name; do
+    [ -n "$database_name" ] || continue
+    printf '%s\n' "$(display_branch_name_for_source "$source_database" "$database_name")"
+  done <<< "$existing_branches"
+
+  printf '%s\n' "$CREATE_NEW_BRANCH_OPTION"
+}
+
+prompt_for_branch_target() {
+  local source_database="$1"
+  local all_databases="$2"
+  local existing_branches="$3"
+  local options
+  local choice
+
+  if [ "$(count_lines "$existing_branches")" -eq 0 ]; then
+    printf '%s\n' "$CREATE_NEW_BRANCH_OPTION"
+    return 0
+  fi
+
+  options="$(branch_options_for_source "$source_database" "$existing_branches")"
+  choice="$(gum_choose_from_lines "Choose a branch or create a new one" "$options")"
+  printf '%s\n' "$choice"
+}
+
+create_or_select_branch() {
+  local source_database="$1"
+  local all_databases="$2"
+  local branch_choice="$3"
+  local branch_label
+  local branch_database
+
+  if [ "$branch_choice" != "$CREATE_NEW_BRANCH_OPTION" ]; then
+    printf '%s\n' "$(canonical_database_name "$branch_choice")"
+    return 0
+  fi
+
+  while true; do
+    branch_label="$(gum_input_value "Branch name: " "feature_login")"
+    branch_label="$(normalize_branch_name "$branch_label")"
+
+    if [ -z "$branch_label" ]; then
+      printf 'berry: Branch names must contain at least one letter or number.\n' >&2
+      continue
+    fi
+
+    branch_database="${source_database}${BRANCH_SEPARATOR}${branch_label}"
+
+    if database_exists "$branch_database" "$all_databases"; then
+      if gum_confirm_action "Branch '$branch_label' already exists. Use it instead?"; then
+        printf '%s\n' "$branch_database"
+        return 0
+      fi
+      continue
+    fi
+
+    if ! gum_confirm_action "Create branch '$branch_label' from '$source_database'?"; then
+      continue
+    fi
+
+    clone_database "$source_database" "$branch_database"
+    printf '%s\n' "$branch_database"
+    return 0
+  done
+}
+
+cmd_list() {
+  local all_databases
+  local size_rows
+  local branch_source=""
+  local regular_databases
+  local branch_databases
+  local rendered_databases
+  local orphan_branches
+  local rendered_orphan_branches
+  local system_databases
+  local rendered_system_databases
+  local label_width
+
+  ensure_psql
+
+  if [ "${1:-}" = "--branches" ]; then
+    shift
+    branch_source="${1:-}"
+    [ -n "$branch_source" ] || die "Usage: berry list --branches <database>"
+    [ "$#" -eq 1 ] || die "Usage: berry list --branches <database>"
+  elif [ "$#" -gt 0 ]; then
+    die "Usage: berry list"
+  fi
+
+  if ! all_databases="$(fetch_all_databases)"; then
+    handle_connection_failure "$all_databases"
+  fi
+
+  if ! size_rows="$(fetch_database_sizes)"; then
+    handle_connection_failure "$size_rows"
+  fi
+
+  if [ -n "$branch_source" ]; then
+    if ! database_exists "$branch_source" "$all_databases"; then
+      die "Database '$branch_source' was not found."
+    fi
+
+    branch_databases="$(filter_branch_databases_for_source "$branch_source" "$all_databases")"
+    if [ "$(count_lines "$branch_databases")" -eq 0 ]; then
+      note "No branches found for '$branch_source'."
+      return 0
+    fi
+
+    label_width="$(compute_list_label_width "" "" "$branch_databases" "")"
+    printf '%s\n' "$(render_plain_database_lines "$branch_databases" "$size_rows" "$label_width" "branch-only")"
+    return 0
+  fi
+
+  regular_databases="$(filter_regular_databases "$all_databases")"
+  branch_databases="$(filter_branch_databases "$all_databases")"
+  orphan_branches="$(filter_orphan_branch_databases "$regular_databases" "$branch_databases")"
+  system_databases="$(filter_system_databases "$all_databases")"
+  label_width="$(compute_list_label_width "$regular_databases" "$all_databases" "$orphan_branches" "$system_databases")"
+  rendered_databases="$(render_regular_database_tree "$regular_databases" "$all_databases" "$size_rows" "$label_width")"
+  rendered_orphan_branches="$(render_plain_database_lines "$orphan_branches" "$size_rows" "$label_width")"
+  rendered_system_databases="$(render_plain_database_lines "$system_databases" "$size_rows" "$label_width")"
+
+  print_section "Databases" "$rendered_databases"
+  print_section "Detached Branches" "$rendered_orphan_branches"
+  print_section "System" "$rendered_system_databases"
+}
+
+cmd_branch() {
+  local all_databases
+  local regular_databases
+  local source_database
+  local existing_branches
+  local branch_choice
+  local target_database
+  local database_url
+
+  ensure_psql
+  ensure_gum
+
+  if [ "$#" -ne 0 ]; then
+    die "Usage: berry branch"
+  fi
+
+  if ! all_databases="$(fetch_all_databases)"; then
+    handle_connection_failure "$all_databases"
+  fi
+
+  regular_databases="$(filter_regular_databases "$all_databases")"
+  if [ "$(count_lines "$regular_databases")" -eq 0 ]; then
+    die "No branchable databases were found."
+  fi
+
+  source_database="$(gum_choose_from_lines "Choose a database to branch" "$regular_databases")"
+  existing_branches="$(filter_branch_databases_for_source "$source_database" "$all_databases")"
+  branch_choice="$(prompt_for_branch_target "$source_database" "$all_databases" "$existing_branches")"
+  target_database="$(create_or_select_branch "$source_database" "$all_databases" "$branch_choice")"
+  database_url="$(build_db_url "$target_database")"
+
+  printf 'Branch ready: %s\n' "$(display_database_name "$target_database")"
+  printf '%s\n' "$database_url"
+}
+
+cmd_delete() {
+  local target_branch="${1:-}"
+  local display_branch
+  local all_databases
+  local branch_databases
+
+  ensure_psql
+  ensure_gum
+
+  if [ "$#" -gt 1 ]; then
+    die "Usage: berry delete [branch_database]"
+  fi
+
+  if ! all_databases="$(fetch_all_databases)"; then
+    handle_connection_failure "$all_databases"
+  fi
+
+  branch_databases="$(filter_branch_databases "$all_databases")"
+  if [ "$(count_lines "$branch_databases")" -eq 0 ]; then
+    die "No branches found to delete."
+  fi
+
+  if [ -z "$target_branch" ]; then
+    target_branch="$(
+      gum_choose_from_lines \
+        "Choose a branch to delete" \
+        "$(printf '%s\n' "$branch_databases" | while IFS= read -r db; do [ -n "$db" ] || continue; display_database_name "$db"; done)"
+    )"
+  fi
+
+  target_branch="$(canonical_database_name "$target_branch")"
+  display_branch="$(display_database_name "$target_branch")"
+  is_branch_database "$target_branch" || die "'$target_branch' is not a branch database."
+  database_exists "$target_branch" "$all_databases" || die "Branch '$target_branch' was not found."
+
+  if ! gum_confirm_action "Delete branch '$display_branch'? This cannot be undone."; then
+    die "Cancelled."
+  fi
+
+  delete_branch_database "$target_branch"
+  printf 'Deleted branch: %s\n' "$display_branch"
+}
+
+cmd_url() {
+  local target_database="${1:-}"
+  local all_databases
+
+  ensure_psql
+
+  if [ "$#" -gt 1 ]; then
+    die "Usage: berry url <database>"
+  fi
+
+  if ! all_databases="$(fetch_all_databases)"; then
+    handle_connection_failure "$all_databases"
+  fi
+
+  if [ -z "$target_database" ]; then
+    ensure_gum
+
+    target_database="$(gum_choose_from_lines "Choose a database" "$(printf '%s\n' "$all_databases" | while IFS= read -r db; do [ -n "$db" ] || continue; display_database_name "$db"; done)")"
+  fi
+
+  target_database="$(canonical_database_name "$target_database")"
+  database_exists "$target_database" "$all_databases" || die "Database '$target_database' was not found."
+  printf '%s\n' "$(build_db_url "$target_database")"
+}
+
+main() {
+  local command="${1:-help}"
+
+  if [ -t 1 ] && [ "${TERM:-}" != "dumb" ] && [ -z "${NO_COLOR:-}" ]; then
+    USE_COLOR=1
+  fi
+
+  case "$command" in
+    list)
+      shift
+      cmd_list "$@"
+      ;;
+    branch)
+      shift
+      cmd_branch "$@"
+      ;;
+    delete)
+      shift
+      cmd_delete "$@"
+      ;;
+    url)
+      shift
+      cmd_url "$@"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      die "Unknown command '$command'. Run 'berry help' for usage."
+      ;;
+  esac
+}
+
+main "$@"
