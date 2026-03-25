@@ -1,6 +1,6 @@
 # berry
 
-`berry` is a bash-only Postgres branch manager with a small TUI powered by [`gum`](https://github.com/charmbracelet/gum).
+`berry` is a single-script bash-only Postgres branch manager with a small TUI powered by [`gum`](https://github.com/charmbracelet/gum).
 
 When working on a feature branch, it's likely migrations on that branch wouldn't be needed on the other branches (or at least the main branch) yet. `berry` allows to create copies (aka branches) of the main dev db and build from there so you don't have to recreate and re-seed the db every time.
 
